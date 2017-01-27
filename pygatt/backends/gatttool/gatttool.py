@@ -1,9 +1,11 @@
 from __future__ import print_function
 
 import functools
+import itertools
 import re
 import logging
 import platform
+import signal
 import sys
 import time
 import threading
@@ -60,30 +62,39 @@ class GATTToolReceiver(threading.Thread):
         self._parent_aliveness = parent_aliveness
         self._event_vector = {
             'notification': {
-                'pattern': r'Notification handle = .*? \r',
+                'patterns': [r'Notification handle = .*? \r'],
             },
             'indication': {
-                'pattern': r'Indication   handle = .*? \r',
+                'patterns': [r'Indication   handle = .*? \r'],
             },
             'disconnected': {
-                'pattern': r'.*Disconnected\r',
+                'patterns': [
+                    r'.*Disconnected',
+                    r'.*Invalid file descriptor',
+                ]
             },
             'char_written': {
-                'pattern': r'Characteristic value (was )?written successfully',
+                'patterns': [
+                    r'Characteristic value (was )?written successfully',
+                ]
             },
             'value': {
-                'pattern': r'value: .*? \r',
+                'patterns': [r'value: .*? \r']
+            },
+            'value/descriptor': {
+                'patterns': [r'value/descriptor: .*? \r']
             },
             'discover': {
-                'pattern':
+                'patterns': [
                     r'handle: 0x([a-fA-F0-9]{4}), '
                     'char properties: 0x[a-fA-F0-9]{2}, '
                     'char value handle: 0x([a-fA-F0-9]{4}), '
                     'uuid: ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]'
                     '{4}-[0-9a-f]{12})\r\n',  # noqa
+                ]
             },
             'connect': {
-                'pattern': r'Connection successful.*\[LE\]>',
+                'patterns': [r'Connection successful.*\[LE\]>']
             },
         }
 
@@ -95,10 +106,11 @@ class GATTToolReceiver(threading.Thread):
             event["callback"] = None
 
     def run(self):
-        items = sorted([
-            (event["pattern"], event)
-            for event in self._event_vector.values()
-        ])
+        items = sorted(itertools.chain.from_iterable(
+            [[(pattern, event)
+              for pattern in event["patterns"]]
+             for event in self._event_vector.values()])
+        )
         patterns = [item[0] for item in items]
         events = [item[1] for item in items]
 
@@ -198,7 +210,18 @@ class GATTToolBackend(BLEBackend):
     def supports_unbonded(self):
         return False
 
-    def start(self, reset_on_start=True):
+    def start(self, reset_on_start=True, initialization_timeout=3):
+        """
+        Run gatttool to prepare for sending commands and monitoring the CLI tool
+        output.
+
+        :param bool reset_on_start: Perhaps due to a bug in gatttol or pygatt,
+            but if the bluez backend isn't restarted, it can sometimes lock up
+            the computer when trying to make a connection to HCI device.
+        :param int initialization_timeout: Seconds to wait for the gatttool
+            prompt. This should appear almost instantly, but on some HCI devices
+            it may take longer to start up.
+        """
         if self._con and self._running.is_set():
             self.stop()
 
@@ -220,8 +243,9 @@ class GATTToolBackend(BLEBackend):
         gatttool_cmd = ' '.join([arg for arg in args if arg])
         log.debug('gatttool_cmd=%s', gatttool_cmd)
         self._con = pexpect.spawn(gatttool_cmd, logfile=self._gatttool_logfile)
-        # Wait for response
-        self._con.expect(r'\[LE\]>', timeout=1)
+
+        # Wait for the interactive prompt
+        self._con.expect(r'\[LE\]>', timeout=initialization_timeout)
 
         # Start the notification receiving thread
         self._receiver = GATTToolReceiver(self._con, self._running)
@@ -276,16 +300,24 @@ class GATTToolBackend(BLEBackend):
         try:
             scan.expect('foooooo', timeout=timeout)
         except pexpect.EOF:
-            message = "Unexpected error when scanning"
-            if "No such device" in scan.before.decode('utf-8'):
+            before_eof = scan.before.decode('utf-8')
+            if "No such device" in before_eof:
                 message = "No BLE adapter found"
+            elif "Set scan parameters failed: Input/output error" in before_eof:
+                message = ("BLE adapter requires reset after a scan as root"
+                           "- call adapter.reset()")
+            else:
+                message = "Unexpected error when scanning: %s" % before_eof
             log.error(message)
             raise BLEError(message)
         except pexpect.TIMEOUT:
             devices = {}
             for line in scan.before.decode('utf-8').split('\r\n'):
+                if 'sudo' in line:
+                    raise BLEError("Enable passwordless sudo for 'hcitool' "
+                                   "before scanning")
                 match = re.match(
-                    r'(([0-9A-Fa-f][0-9A-Fa-f]:?){6}) (\(?[\w]+\)?)', line)
+                    r'(([0-9A-Fa-f][0-9A-Fa-f]:?){6}) (\(?.+\)?)', line)
 
                 if match is not None:
                     address = match.group(1)
@@ -307,6 +339,21 @@ class GATTToolBackend(BLEBackend):
                         }
             log.info("Found %d BLE devices", len(devices))
             return [device for device in devices.values()]
+        finally:
+            # Wait for lescan to exit cleanly, otherwise it leaves the BLE
+            # adapter in a bad state and the device must be reset through BlueZ.
+            # This will not work if run_as_root was used, since this process
+            # itself doesn't have permission to terminate a process running as
+            # root (hcitool itself). We recommend using the setcap tool to allow
+            # scanning as a non-root user:
+            #
+            #    $ sudo setcap 'cap_net_raw,cap_net_admin+eip' `which hcitool`
+            try:
+                scan.kill(signal.SIGINT)
+                scan.wait()
+            except OSError:
+                log.error("Unable to gracefully stop the scan - "
+                          "BLE adapter may need to be reset.")
         return []
 
     def connect(self, address, timeout=DEFAULT_CONNECT_TIMEOUT_S,
@@ -461,6 +508,21 @@ class GATTToolBackend(BLEBackend):
         with self._receiver.event("value", timeout=timeout):
             self.sendline('char-read-uuid %s' % uuid)
         rval = self._receiver.last_value("value", "after").split()[1:]
+        return bytearray([int(x, 16) for x in rval])
+
+    @at_most_one_device
+    def char_read_handle(self, handle, timeout=4):
+        """
+        Reads a Characteristic by handle.
+        :param handle: handle of Characteristic to read.
+        :type handle: str
+        :return: bytearray of result.
+        :rtype: bytearray
+        """
+        with self._receiver.event("value/descriptor", timeout=timeout):
+            self.sendline('char-read-hnd %s' % handle)
+        rval = self._receiver.last_value("value/descriptor", "after"
+                                         ).split()[1:]
         return bytearray([int(x, 16) for x in rval])
 
     def reset(self):

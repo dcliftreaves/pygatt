@@ -7,7 +7,6 @@ try:
 except ImportError:
     import Queue as queue
 
-import termios
 import logging
 import serial
 import time
@@ -29,6 +28,15 @@ from .packets import BGAPICommandPacketBuilder as CommandBuilder
 from .error_codes import get_return_message
 from .util import find_usb_serial_devices
 
+try:
+    import termios
+except ImportError:
+    # Running in Windows (not Linux/OS X/Cygwin)
+    serial_exception = RuntimeError
+else:
+    serial_exception = termios.error
+
+
 log = logging.getLogger(__name__)
 
 BLED112_VENDOR_ID = 0x2458
@@ -38,6 +46,10 @@ MAX_RECONNECTION_ATTEMPTS = 10
 
 UUIDType = Enum('UUIDType', ['custom', 'service', 'attribute',
                              'descriptor', 'characteristic'])
+
+
+def _timed_out(start_time, timeout):
+    return time.time() - start_time > timeout
 
 
 def bgapi_address_to_hex(address):
@@ -64,7 +76,7 @@ class BGAPIBackend(BLEBackend):
     """
     A BLE backend for a BGAPI compatible USB adapter.
     """
-    def __init__(self, serial_port=None):
+    def __init__(self, serial_port=None, receive_queue_timeout=0.1):
         """
         Initialize the backend, but don't start the USB connection yet. Must
         call .start().
@@ -74,6 +86,7 @@ class BGAPIBackend(BLEBackend):
         """
         self._lib = bglib.BGLib()
         self._serial_port = serial_port
+        self._receive_queue_timeout = receive_queue_timeout
 
         self._ser = None
         self._receiver = None
@@ -82,10 +95,6 @@ class BGAPIBackend(BLEBackend):
 
         # buffer for packets received
         self._receiver_queue = queue.Queue()
-
-        self._connected_devices = {
-            # handle: BLEDevice
-        }
 
         # State
         self._num_bonds = 0  # number of bonds stored on the adapter
@@ -133,10 +142,11 @@ class BGAPIBackend(BLEBackend):
         Raises a NotConnectedError if the device cannot connect after 10
         attempts, with a short pause in between each attempt.
         """
-        serial_port = self._serial_port or self._detect_device_port()
-        self._ser = None
         for _ in range(MAX_RECONNECTION_ATTEMPTS):
             try:
+                serial_port = self._serial_port or self._detect_device_port()
+                self._ser = None
+
                 log.debug("Attempting to connect to serial port after "
                           "restarting device")
                 self._ser = serial.Serial(serial_port, baudrate=115200,
@@ -144,7 +154,8 @@ class BGAPIBackend(BLEBackend):
                 # Wait until we can actually read from the device
                 self._ser.read()
                 break
-            except (serial.serialutil.SerialException, termios.error):
+            except (BGAPIError, serial.serialutil.SerialException,
+                    serial_exception):
                 if self._ser:
                     self._ser.close()
                 self._ser = None
@@ -487,13 +498,18 @@ class BGAPIBackend(BLEBackend):
                         data_dict[field_name] = dev_name
                     elif (field_name ==
                           'complete_list_128-bit_service_class_uuids'):
-                        data_dict[field_name] = []
-                        for i in range(0, len(field_value) / 16):  # 16 bytes
-                            service_uuid = (
-                                "0x%s" %
-                                bgapi_address_to_hex(
-                                    field_value[i * 16:i * 16 + 16]))
-                            data_dict[field_name].append(service_uuid)
+                        if len(field_value) % 16 == 0:  # 16 bytes
+                            data_dict[field_name] = []
+                            for i in range(0, len(field_value) / 16):
+                                service_uuid = (
+                                    "0x%s" %
+                                    bgapi_address_to_hex(
+                                        field_value[i * 16:i * 16 + 16]))
+                                data_dict[field_name].append(service_uuid)
+                        else:
+                            log.warning("Expected a service class UUID of 16\
+                                        bytes. Instead received %d bytes",
+                                        len(field_value))
                     else:
                         data_dict[field_name] = bytearray(field_value)
         return dev_name, data_dict
@@ -527,11 +543,11 @@ class BGAPIBackend(BLEBackend):
         while True:
             packet = None
             try:
-                # TODO can we increase the timeout here?
-                packet = self._receiver_queue.get(timeout=0.1)
+                packet = self._receiver_queue.get(
+                    timeout=self._receive_queue_timeout)
             except queue.Empty:
                 if timeout is not None:
-                    if time.time() - start_time > timeout:
+                    if _timed_out(start_time, timeout):
                         exc = ExpectedResponseTimeout(
                             expected_packet_choices, timeout)
                         exc.__cause__ = None
