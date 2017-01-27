@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 BLED112_VENDOR_ID = 0x2458
 BLED112_PRODUCT_ID = 0x0001
-MAX_RECONNECTION_ATTEMPTS = 10
+MAX_RECONNECTION_ATTEMPTS = 50
 
 
 UUIDType = Enum('UUIDType', ['custom', 'service', 'attribute',
