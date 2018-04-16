@@ -488,7 +488,7 @@ class BGAPIBackend(BLEBackend):
                     elif (field_name ==
                           'complete_list_128-bit_service_class_uuids'):
                         data_dict[field_name] = []
-                        for i in range(0, len(field_value) / 16):  # 16 bytes
+                        for i in range(0, len(field_value) // 16):  # 16 bytes
                             service_uuid = (
                                 "0x%s" %
                                 bgapi_address_to_hex(
