@@ -559,14 +559,17 @@ class BGAPIBackend(BLEBackend):
         """
         log.info("Running receiver")
         while self._running.is_set():
-            packet = self._lib.parse_byte(self._ser.read())
-            if packet is not None:
-                packet_type, args = self._lib.decode_packet(packet)
-                if packet_type == EventPacketType.attclient_attribute_value:
-                    device = self._connections[args['connection_handle']]
-                    device.receive_notification(args['atthandle'],
-                                                bytearray(args['value']))
-                self._receiver_queue.put(packet)
+            # read all bytes in buffer at once to keep os buffers small
+            ser_bytes = self._ser.read(self._ser.inWaiting())
+            for byte in (ser_bytes[i:i+1] for i in range(len(ser_bytes))) :
+                packet = self._lib.parse_byte(byte)
+                if packet is not None:
+                    packet_type, args = self._lib.decode_packet(packet)
+                    if packet_type == EventPacketType.attclient_attribute_value:
+                        device = self._connections[args['connection_handle']]
+                        device.receive_notification(args['atthandle'],
+                                                    bytearray(args['value']))
+                    self._receiver_queue.put(packet)
         log.info("Stopping receiver")
 
     def _ble_evt_attclient_attribute_value(self, args):
