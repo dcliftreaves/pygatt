@@ -179,18 +179,29 @@ class BGAPIBackend(BLEBackend):
         self._ser.flush()
         self._ser.close()
 
-        time.sleep(0.2)
+        # Now the port should disappear and re-appear.
+        # Hopefully as the same port name ...
+        for i in range(5) :
+            time.sleep(2)
 
-        # if our port was pulled out from under us then go find
-        # our original port
-        new_ports = find_usb_serial_devices(
-            vendor_id=BLED112_VENDOR_ID,
-            product_id=BLED112_PRODUCT_ID)
-        new_ports = set(x.port_name for x in new_ports)
-        if not self._serial_port in new_ports :
-            log.debug("After reset, Port path disappeared: " + self._serial_port)
-            self._serial_port = (new_ports - orig_ports).pop()
-            log.debug("new Port path: " + self._serial_port)
+            # if our port was pulled out from under us then go find
+            # our original port
+            new_ports = find_usb_serial_devices(
+                vendor_id=BLED112_VENDOR_ID,
+                product_id=BLED112_PRODUCT_ID)
+            new_ports = set(x.port_name for x in new_ports)
+            new_ports_non_orig = new_ports - orig_ports
+            # if our port reappeared where we expected then quit looking
+            if new_ports == orig_ports :
+                break
+            elif len(new_ports_non_orig) != 0 :
+                if not self._serial_port in new_ports :
+                    log.debug("After reset, Port path disappeared: " + self._serial_port)
+                    self._serial_port = new_ports_non_orig.pop()
+                    log.debug("new Port path: " + self._serial_port)
+                break
+
+
 
         self._open_serial_port()
         self._receiver = threading.Thread(target=self._receive)
